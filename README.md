@@ -1,3 +1,5 @@
-# netdr - linux network driver 
+# Netdr 
+
+## non-vendor-specific Linux network driver  
 
 
