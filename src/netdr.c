@@ -22,7 +22,7 @@ static int netdr_alloc_rx_buffer(struct netdr_nic *nic, int idx)
     struct netdr_buffer *buf = &nic->rx_buffers[idx];
     struct netdr_desc *desc = &nic->rx_ring[idx]; 
     
-    struct sk_buff *sk_buff *skb; 
+    struct sk_buff *skb; 
     dma_addr_t dma; 
 
     /*allocate socket buffer with room for headers */ 
@@ -102,7 +102,7 @@ static int netdr_setup_rx_ring(struct netdr_nic *nic)
         if(err)
         {
             while (--i >= 0)
-                mynet_free_rx_buffer(nic, i);
+                netdr_free_rx_buffer(nic, i);
             dma_free_cohere t(&nic->pdev->dev, 
                               RX_RING_SIZE * sizeof(struct netdr_desc), 
                               nic->rx_ring, nic->rx_ring_dma);
@@ -141,5 +141,77 @@ static void netdr_free_rx_ring(struct netdr_nic *nic)
     }
 }
 
+static int netdr_setup_tx_ring(struct netdr_nic *nic)
+{
+    nic->tx_ring = dma_alloc_coherent(&nic->pdev-dev, 
+                                      TX_RING_SIZE * sizeof(struct netdr_desc),
+                                      &nic->tx_ring_dma, GFP_KERNEL); 
+
+    if(!nic->tx_ring)
+    {
+        netdev_err(nic->netdev, "Failed to allocate TX ring\n"); 
+    }
+
+    nic->tx_buffers = kcalloc(TX_RING_SIZE, sizeof(struct netdr_buffer), GFP_KERNEL); 
+    if(!nic->tx_buffers)
+    {
+        dma_free_coherent(&nic->pdev->dev, 
+                          TX_RING_SIZE * sizeof(struct netdr_desc), 
+                          nic->tx_ring, nic->tx_ring_dma);
+        return -ENOMEM; 
+    }
+
+    nic->tx_head = 0; 
+    nic->tx_tail = 0; 
+
+    spin_lock_init(&nic->tx_lock);
+
+    netdr_write_reg(nic, REG_TX_DESC_BASE, (u32)(nic->tx_ring_dma & 0xFFFFFFFF)); 
+    netdr_write_reg(nic, REG_TX_DESC_LEN, TX_RING_SIZE); 
+    netdr_write_reg(nic, REG_TX_HEAD, 0); 
+    netdr_write_reg(nic, REG_TX_TAIL, 0);
+
+    return 0; 
+}
+
+
+static void netdr_free_tx_ring(struct netdr_nic *nic)
+{
+    int i; 
+
+    if(nic->tx_buffers)
+    {
+        for(i =0; i < TX_RING_SIZE; i++){
+            if(nic->tx_buffers[i].skb)
+            {
+                dma_unmap_single(&nic->pdev->dev, 
+                                 nic->tx_buffers[i].dma, 
+                                 nic->tx_buffers[i].length, 
+                                 DMA_TO_DEVICE); 
+                dev_kfree_skb(nic->tx_buffers[i].skb); 
+            }
+        }
+        kfree(nic->tx_buffers); 
+        nic->tx_buffers = NULL;
+    }
+
+    if(nic->tx_ring)
+    {
+        dma_free_coherent(&nic->pdev-dev, 
+                          TX_RING_SIZE *sizeof(struct netdr_desc), 
+                          nic->tx_ring, nic->tx_ring_dma); 
+        nic->tx_ring; 
+    }
+}
+
+/*processes completed transmit descriptors and frees up resources */ 
+static bool netdr_clean_tx_ring(struct netdr_nic *nic)
+{
+    unsigned int budget = TX_RING_SIZE; 
+    bool cleaned = false; 
+
+    /*process completed descrpitors*/ 
+    while(budget-- && nic->tx_tail != nic->tx_head)
+}
 
 
