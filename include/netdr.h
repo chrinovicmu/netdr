@@ -45,7 +45,7 @@ struct netdr_desc
     __le16 length; 
     __le16 checksum ;
     __le32 status; 
-}__attribute(packed()); 
+}__attribute__((packed)); 
 
 /*descriptor status bits */ 
 #define DESC_STATUS_DD      (1 << 0)

@@ -1,21 +1,17 @@
+MODULE_NAME := netdr
+obj-m := src/$(MODULE_NAME).o
 
-CC := gcc
-CFLAGS := -Wall -Wextra -I.
+# Use absolute path for the include directory
+# This ensures the compiler finds it regardless of which directory Kbuild is in
+ccflags-y := -I$(PWD)/include
 
-SRCS := $(wildcard src/*.c)
-OBJS := $(SRCS:.c=.o
-)
-TARGET := netdr
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD  := $(shell pwd)
 
-all: $(TARGET)
-
-$(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $@
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
 .PHONY: all clean
