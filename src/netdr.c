@@ -324,6 +324,52 @@ static int netdr_poll(struct napi_struct napi, int budget)
     return work_done; 
 }
 
+static irqreturn_t netdr_interrupt(int irq, void *data) 
+{
+    struct net_device *netdev = data; 
+    struct netdr_nic nic = netdev_priv(netdev); 
+    u32 int_status; 
+
+    int_status = netdr_read_reg(nic, REG_INT_STATUS); 
+
+    if(!int_status)
+        return IRQ_NONE; 
+
+    /*acknowledge intterupt by writing back*/ 
+    netdr_write_reg(nic, REG_INT_STATUS, int_status); 
+
+    if(int_status & INT_RX_COMPLETED)
+    {
+        /*disable intterupts and schedle NAPI*/ 
+        netdr_write_reg(nic, REG_INT_MASK, 0); 
+        napi_schedule(&nic->napi); 
+    }
+
+    if(int_status & INT_TX_COMPLETE)
+        netdr_clean_tx_ring(nic);
+
+    if(int_status & INT_LINK_CHANGE)
+    {
+        u32 status = netdr_read_reg(nic, REG_STATUS); 
+        bool link_up = !!(status & 0x1); 
+
+        if(link_up != nic->link_up){
+            nic->link_up = link_up; 
+
+            if(link_up)
+            {
+                netif_carrier_on(netdev); 
+                netdev_info(netdevm "Link is up\n");
+            }else{
+                netif_carrier_off(netdev); 
+                netdev_info(netdev, "Link is down\n"); 
+            }
+        }
+
+    }
+
+    return IRQ_HANDLED; 
+}
 
 static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
@@ -347,7 +393,7 @@ static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
     desc = &nic->tx_ring[idx]; 
     buf = &nic->tx_buffers[idx]; 
 
-    dam = dma_map_single(&nic->pdev-dev, skb->data, skb->len, 
+    dma = dma_map_single(&nic->pdev-dev, skb->data, skb->len, 
                          DMA_TO_DEVICE); 
 
     if(dma_mapping_error(&nic->pdev-dev, dma))
@@ -355,7 +401,7 @@ static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
         spin_unlock(&nic->lock);
         dev_kfree_skb(skb); 
         nic->stats.tx_erros++; 
-        return NETDEV_TX_OK; 
+        retu n NETDEV_TX_OK; 
     }
 
     buf->skb = skb; 
@@ -380,3 +426,247 @@ static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
 
     return NETDEV_TX_OK; 
 }
+
+static int netdr_open(struct net_device *netdev)
+{
+    struct netdr_nic *nic = netdev_priv(netdev); 
+    int err; 
+
+    err = netdr_setup_rx_ring(nic); 
+    if(err)
+        return err; 
+
+    err = netdr_setup_tx_ring(nic); 
+    if(err)
+    {
+        netdr_free_rx_ring(nic); 
+        return err; 
+    }
+    err = request_irq(nic->irq, netdr_interrupt, IRQF_SHARED, 
+                      netdev->name, netdev); 
+    if(err)
+    {
+        netdev_err(netdev, "Failed to request IRQ %d\n", nic->irq); 
+        netdr_free_tx_ring(nic); 
+        netdr_free_tx_ring(nic); 
+        return err; 
+    }
+
+    napi_enable(&nic->napi); 
+
+    netdr_write_reg(nic, REG_CTRL, CTRL_RX_ENABLE | CTRL_TX_ENABLE);
+    netdr_write_reg(nic, REG_INT_MASK, INT_ALL); 
+    netif_start_queue(netdev); 
+    netdev_info(netdev, "Interface opened\n"); 
+
+    return 0; 
+}
+
+static int netdr_stop(struct net_device *netdev)
+{
+    struct netdr_nic *nic = netdev_priv(netdev); 
+
+    netif_stop_queue(netdev); 
+
+    netdr_write_reg(nic, REG_CTRL, 0); 
+    netdr_write_reg(nic, REG_INT_MASK, 0); 
+
+    napi_disable(nic->napi); 
+
+    free_irq(nic->irq, netdev); 
+
+    netdr_free_tx_ring(nic); 
+    netdr_free_rx_ring(nic); 
+
+    netdev_info(netdev, "Interface closed\n"); 
+
+    return 0; 
+}
+
+/*get stats*/ 
+static struct net_device_stats *netdr_get_stats(struct net_device *netdev)
+{
+    struct netdr_nic * nic = netdev_priv(netdev); 
+    return &nic->stats;
+}
+
+static int netdr_change_mtu(struct net_device, int mtu)
+{
+    if(mtu < 68 || mtu > 1500)
+        return -EINVAL; 
+
+    netdev->mtu = mtu; 
+    return 0; 
+}
+
+static const struct net_device_ops netdr_netdev_ops = {
+    .ndo_open = netdr_open, 
+    .ndo_stop = netdr_stop, 
+    .ndo_statt_xmit = netdr_xmit, 
+    .ndo_get_stats = netdr_get_stats,
+    .ndo_validate_addr = eth_validate_addr, 
+    .ndo_set_mac_address = eth_mac_addr,  
+}; 
+
+static void netdr_get_drvinfo(struct net_device,
+                              struct ethtool_drv_info *info)
+{
+    struct netdr_nic *nic = netdev_priv(netdev); 
+
+    strlcpy(info->driver, "netdr", sizeof(info->driver)); 
+    strlcpy(info->version, "1.0", sizeof(info->driver)); 
+    strlcpy(info->bus_info, pci_name(nic->pdev), sizeof(info->bus_info)); 
+}
+
+static const struct ethool_ops netdr_ethtool_ops =  {
+    .get_drvinfo = netdr_get_drvinfo, 
+    .get_link = ethtool_op_get_link, 
+}; 
+
+
+static int netdr_reset_hw(struct netdr_nic *nic)
+{
+    int timeout; 
+
+    netdr_write_reg(nic, REG_CTRL, CTRL_RESET); 
+
+    while(timeout--)
+    {
+        if(!(netdr_read_reg(nic, REG_CTRL) & CTRL_RESET))
+            break; 
+        usleep_range(10, 20); 
+    }
+
+    if(timeout < 0)
+    {
+        pr_err("netdr: Hardware reset timeout\n"); 
+        return -EIO; 
+    }
+
+    msleep(10); 
+
+    return 0; 
+}
+
+
+static int netdr_probe(struct pci_dev *pdev, const struct pci_device *id)
+{
+    struct net_device = *netdev; 
+    struct netdr_nic *nic; 
+    int err; 
+
+    err = pci_enable(pdev); 
+    if(err)
+        return err; 
+
+    /*set DMA mask for 32-bit addressing */ 
+    err = dma_set_mask_and_coherant(&pdev->dev, DMA_BIT_MASK(32)); 
+    if(err)
+    {
+        dev_err(&pdev->dev, "Failed to set DMA mask\n"); 
+        goto _err_dma; 
+    }
+
+    err = pci_request_regions(pdev, "netdr"); 
+    if(err)
+        goto _err_regions; 
+
+    pci_set_master(pdev); 
+
+    netdev = alloc_etherdev(sizeof(struct netdr_nic)); 
+    if(!netdev){
+        err = -ENOMEM; 
+        goto _err_alloc; 
+    }
+
+    SET_NETDEV_DEV(netdev, &pdev->dev); 
+    pci_set_drvdata(pdev, netdev); 
+
+    nic = netdev_priv(netdev); 
+    nic->netdev = nettdev; 
+    nic->pdev = pdev; 
+    nic->irq = pdev->irq; 
+
+    nic->hw_addr = pci_iomap(pdev, 0, 0); 
+    if(!nic->hw_addr)
+    {
+        err = -ENOMEM; 
+        goto _err_iomap; 
+    }
+
+    err = netdr_reset_hw(nic); 
+    if(err)
+        goto _err_reset; 
+
+    netdev->netdev_ops = &netdr_netdev_ops; 
+    netdev->ethtoll_ops = &netdr_ethtool_ops; 
+
+    netdr_write_reg(nic, REG_MAC_ADDR_LOW, 
+                    *(u32*)&netdev->dev_addr[0]);
+    netdr_write_reg(nic, REG_MAC_ADDR_HIGH, 
+                    *(u32*)&netdev->dev_addr[4]); 
+
+    err = register_netdev(netdev); 
+    if(err)
+        goto _err_register; 
+
+    netdev_info(netdev, "netdr driver loaded succesffully\n"); 
+
+    return 0; 
+_err_register:
+_err_reset:
+    pci_iounmao(pdev, nic->hw_addr); 
+_err_iomap:
+    free_netdev(netdev); 
+_err_alloc:
+    pci_release_regions(pdev); 
+_err_regions:
+_err_dma:
+    pci_disable_device(pdev); 
+    return err; 
+}
+
+static void netdr_remove(struct pci_dev *pdev)
+{
+    struct net_device *netdev = pci_get_drvdata(pdev); 
+    struct netdr_nic *nic = netdev_priv(netdev); 
+
+    unregister_netdev(netdev);
+    netif_napi_dev(&nic->napi); 
+    pci_iounmap(pdev, nic->hw_addr); 
+    free_netdev(netdev); 
+    pci_release_regions(pdev); 
+    pci_disable_device(pdev); 
+
+    pr_info("netdr: Device removed\n"); 
+
+}
+
+static const struct pci_device_id netdr_pci_tbl[] = {
+    {PCI_DEVICE(0x8086, 0X1234)}, 
+    {0,}
+}; 
+MODULE_DEVICE_TABLE(pci, netdr_pci_tbl); 
+
+
+static struct pci_driver netdr_pci_driver = {
+    .name = "netdr", 
+    .id_table = netdr_pci_tbl, 
+    .probe = netdr_probe, 
+    .remove = netdr_remove, 
+};
+
+static int __init netdr_init_module(void)
+{
+    pr_info("netdr: Loading network driver\n"); 
+    return pci_register_driver(&netdr_pci_driver); 
+}
+static void __exit netdr_exit_module(void)
+{
+    pr_info("netdr: Unloading network driver\n"); 
+    pci_unregister_driver(&netdr_pci_driver); 
+}
+module_init(netdr_init_module); 
+module_exit(netdr_exit_module); 
+
+
