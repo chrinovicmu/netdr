@@ -1,11 +1,11 @@
-#include <cerrno>
-#include <cstddef>
-#include <endian.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/delay.h>
-#include <include/netdr.h> 
+#include <linux/pci.h> 
+#include <linux/netdevice.h> 
+#include <linux/etherdevice.h> 
+#include <linux/skbuff.h> 
 
 static inline void netdr_write_reg(struct netdr_nic *nic, u32 reg, u32 value)
 {
@@ -14,7 +14,7 @@ static inline void netdr_write_reg(struct netdr_nic *nic, u32 reg, u32 value)
 
 static inline u32 netdr_read_reg(struct netdr_nic *nic, u32 reg)
 {
-    return readl(nic->hw_addr + regs); 
+    return readl(nic->hw_addr + reg);
 }
 
 
@@ -105,9 +105,10 @@ static int netdr_setup_rx_ring(struct netdr_nic *nic)
         {
             while (--i >= 0)
                 netdr_free_rx_buffer(nic, i);
-            dma_free_cohere t(&nic->pdev->dev, 
+            dma_free_coherent(&nic->pdev->dev, 
                               RX_RING_SIZE * sizeof(struct netdr_desc), 
                               nic->rx_ring, nic->rx_ring_dma);
+            kfree(nic->rx_buffers); 
             return err; 
         }
     }
@@ -134,10 +135,10 @@ static void netdr_free_rx_ring(struct netdr_nic *nic)
         nic->rx_buffers = NULL; 
     }
 
-    if(nic-rx_ring)
+    if(nic->rx_ring) 
     {
         dma_free_coherent(&nic->pdev->dev, 
-                          RX_RING_SIZE *sizeof(struct netdr_desc), 
+                          RX_RING_SIZE * sizeof(struct netdr_desc), 
                           nic->rx_ring, nic->rx_ring_dma); 
         nic->rx_ring = NULL; 
     }
@@ -145,7 +146,7 @@ static void netdr_free_rx_ring(struct netdr_nic *nic)
 
 static int netdr_setup_tx_ring(struct netdr_nic *nic)
 {
-    nic->tx_ring = dma_alloc_coherent(&nic->pdev-dev, 
+    nic->tx_ring = dma_alloc_coherent(&nic->pdev->dev, 
                                       TX_RING_SIZE * sizeof(struct netdr_desc),
                                       &nic->tx_ring_dma, GFP_KERNEL); 
 
@@ -184,7 +185,7 @@ static void netdr_free_tx_ring(struct netdr_nic *nic)
 
     if(nic->tx_buffers)
     {
-        for(i =0; i < TX_RING_SIZE; i++){
+        for(i = 0; i < TX_RING_SIZE; i++){
             if(nic->tx_buffers[i].skb)
             {
                 dma_unmap_single(&nic->pdev->dev, 
@@ -200,10 +201,10 @@ static void netdr_free_tx_ring(struct netdr_nic *nic)
 
     if(nic->tx_ring)
     {
-        dma_free_coherent(&nic->pdev-dev, 
-                          TX_RING_SIZE *sizeof(struct netdr_desc), 
+        dma_free_coherent(&nic->pdev->dev,
+                          TX_RING_SIZE * sizeof(struct netdr_desc), 
                           nic->tx_ring, nic->tx_ring_dma); 
-        nic->tx_ring; 
+        nic->tx_ring = NULL; // Fixed: added missing assignment
     }
 }
 
@@ -212,6 +213,8 @@ static bool netdr_clean_tx_ring(struct netdr_nic *nic)
 {
     unsigned int budget = TX_RING_SIZE; 
     bool cleaned = false; 
+
+    spin_lock(&nic->tx_lock); 
 
     /*process completed descrpitors*/ 
     while(budget-- && nic->tx_tail != nic->tx_head)
@@ -222,14 +225,14 @@ static bool netdr_clean_tx_ring(struct netdr_nic *nic)
 
         /*check if descrpitor is completed by hardware 
          * exit if not completed*/ 
-        (!(le32_to_cpu(desc->status) & DESC_STATUS_DD))
+        if (!(le32_to_cpu(desc->status) & DESC_STATUS_DD)) 
             break; 
 
         /*unmap dma buffer */ 
-        dma_unmap_single(&nic->pdev-dev, buf->dma, buf->length, DMA_TO_DEVICE); 
+        dma_unmap_single(&nic->pdev->dev, buf->dma, buf->length, DMA_TO_DEVICE); 
 
         if(le32_to_cpu(desc->status) & DESC_STATUS_ERR)
-            nic->stats.tx_erros++; 
+            nic->stats.tx_errors++; 
         else 
             nic->stats.tx_packets++; 
 
@@ -246,10 +249,10 @@ static bool netdr_clean_tx_ring(struct netdr_nic *nic)
 
     /*wake up queue if we free enough descrpitors*/ 
 
-    if(cleaned && netif_queue_stopped(nic->net))
+    if(cleaned && netif_queue_stopped(nic->netdev)) 
     {
         unsigned int free_desc = (nic->tx_tail - nic->tx_head - 1) & 
-            (TX_RING_SIZE -1); 
+            (TX_RING_SIZE - 1); 
 
         /*check if at least 1/4 of the ring is free */ 
         if(free_desc >= (TX_RING_SIZE / 4))
@@ -262,7 +265,7 @@ static bool netdr_clean_tx_ring(struct netdr_nic *nic)
 }
 
 /*poll based network reception, to reduce intterutp load */  
-static int netdr_poll(struct napi_struct napi, int budget)
+static int netdr_poll(struct napi_struct *napi, int budget) 
 {
     struct netdr_nic *nic = container_of(napi, struct netdr_nic, napi); 
     int work_done = 0; 
@@ -271,7 +274,7 @@ static int netdr_poll(struct napi_struct napi, int budget)
     {
         unsigned int idx = nic->rx_tail; 
         struct netdr_desc *desc = &nic->rx_ring[idx]; 
-        struct netdr_buffer *buf = &nic->rx_buffer[idx]; 
+        struct netdr_buffer *buf = &nic->rx_buffers[idx]; 
         struct sk_buff *skb; 
 
         u32 status;
@@ -283,7 +286,7 @@ static int netdr_poll(struct napi_struct napi, int budget)
 
         length = le16_to_cpu(desc->length); 
 
-        dma_unmap_single(&nic->pdev-dev, buf->dma, buf->length, 
+        dma_unmap_single(&nic->pdev->dev, buf->dma, buf->length, 
                          DMA_FROM_DEVICE); 
         
         skb = buf->skb; 
@@ -291,34 +294,34 @@ static int netdr_poll(struct napi_struct napi, int budget)
 
         if(status & DESC_STATUS_ERR)
         {
-            nic->stas.rx_erros++; 
-            dev_kfree(skb); 
+            nic->stats.rx_errors++; 
+            dev_kfree_skb(skb);
             goto _refill; 
         }
 
         skb_put(skb, length); 
         skb->protocol = eth_type_trans(skb, nic->netdev); 
-        skb->ip_smmed = CHECKSOME_NONE; 
+        skb->ip_summed = CHECKSUM_NONE; 
         
         nic->stats.rx_packets++; 
         nic->stats.rx_bytes += length; 
 
         /*pass packet to the network stack */ 
-        napi_gro_recieve(napi, skb); 
+        napi_gro_receive(napi, skb); 
         work_done++;
 
     _refill:
 
         netdr_alloc_rx_buffer(nic, idx); 
 
-        nic->rx_tail = (priv->rx_tail + 1) & (RX_RING_SIZE - 1); 
+        nic->rx_tail = (nic->rx_tail + 1) & (RX_RING_SIZE - 1); 
         netdr_write_reg(nic, REG_RX_TAIL, nic->rx_tail); 
     }
 
     if(work_done < budget)
     {
-        napi_complete_done(napi, work_done); 
-        netdr_write_reg(nic, REG_INT_MASK, INT_ALL); 
+        if (napi_complete_done(napi, work_done)) 
+            netdr_write_reg(nic, REG_INT_MASK, INT_ALL); 
     }
 
     return work_done; 
@@ -327,11 +330,10 @@ static int netdr_poll(struct napi_struct napi, int budget)
 static irqreturn_t netdr_interrupt(int irq, void *data) 
 {
     struct net_device *netdev = data; 
-    struct netdr_nic nic = netdev_priv(netdev); 
+    struct netdr_nic *nic = netdev_priv(netdev); 
     u32 int_status; 
 
     int_status = netdr_read_reg(nic, REG_INT_STATUS); 
-
     if(!int_status)
         return IRQ_NONE; 
 
@@ -359,7 +361,7 @@ static irqreturn_t netdr_interrupt(int irq, void *data)
             if(link_up)
             {
                 netif_carrier_on(netdev); 
-                netdev_info(netdevm "Link is up\n");
+                netdev_info(netdev, "Link is up\n"); 
             }else{
                 netif_carrier_off(netdev); 
                 netdev_info(netdev, "Link is down\n"); 
@@ -371,7 +373,7 @@ static irqreturn_t netdr_interrupt(int irq, void *data)
     return IRQ_HANDLED; 
 }
 
-static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
+static netdev_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev) 
 {
     struct netdr_nic * nic = netdev_priv(netdev); 
     unsigned int idx;
@@ -382,7 +384,7 @@ static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
     spin_lock(&nic->tx_lock); 
 
     /*check if ring is full */ 
-    if(((nic->tx_head +1 ) & (TX_RING_SIZE - 1)) == nic->tx_tail)
+    if(((nic->tx_head + 1 ) & (TX_RING_SIZE - 1)) == nic->tx_tail)
     {
         netif_stop_queue(netdev); 
         spin_unlock(&nic->tx_lock); 
@@ -393,15 +395,15 @@ static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
     desc = &nic->tx_ring[idx]; 
     buf = &nic->tx_buffers[idx]; 
 
-    dma = dma_map_single(&nic->pdev-dev, skb->data, skb->len, 
+    dma = dma_map_single(&nic->pdev->dev, skb->data, skb->len, 
                          DMA_TO_DEVICE); 
 
-    if(dma_mapping_error(&nic->pdev-dev, dma))
+    if(dma_mapping_error(&nic->pdev->dev, dma)) 
     {
-        spin_unlock(&nic->lock);
+        spin_unlock(&nic->tx_lock); 
         dev_kfree_skb(skb); 
-        nic->stats.tx_erros++; 
-        retu n NETDEV_TX_OK; 
+        nic->stats.tx_errors++; 
+        return NETDEV_TX_OK; 
     }
 
     buf->skb = skb; 
@@ -410,16 +412,16 @@ static netdex_tx_t netdr_xmit(struct sk_buff *skb, struct net_device *netdev)
 
     desc->buffer_addr = cpu_to_le64(dma); 
     desc->length = cpu_to_le16(skb->len); 
-    desc->status = cpu_to_le21(DESC_STATUS_EOP); 
+    desc->status = cpu_to_le32(DESC_STATUS_EOP); 
 
-    nic->tx_head = (nic->tx_head + 1) & (TX_RING_SIZE -1); 
+    nic->tx_head = (nic->tx_head + 1) & (TX_RING_SIZE - 1); 
 
     /*mem barrier to ensure descriptor is written */ 
     wmb(); 
 
     netdr_write_reg(nic, REG_TX_TAIL,  nic->tx_head); 
 
-    if(((nic->tx_head + 1) & (TX_RING_SIZE -1)) == nic->tx_tail)
+    if(((nic->tx_head + 1) & (TX_RING_SIZE - 1)) == nic->tx_tail)
         netif_stop_queue(netdev); 
 
     spin_unlock(&nic->tx_lock); 
@@ -448,7 +450,7 @@ static int netdr_open(struct net_device *netdev)
     {
         netdev_err(netdev, "Failed to request IRQ %d\n", nic->irq); 
         netdr_free_tx_ring(nic); 
-        netdr_free_tx_ring(nic); 
+        netdr_free_rx_ring(nic); 
         return err; 
     }
 
@@ -471,7 +473,7 @@ static int netdr_stop(struct net_device *netdev)
     netdr_write_reg(nic, REG_CTRL, 0); 
     netdr_write_reg(nic, REG_INT_MASK, 0); 
 
-    napi_disable(nic->napi); 
+    napi_disable(&nic->napi); 
 
     free_irq(nic->irq, netdev); 
 
@@ -490,7 +492,7 @@ static struct net_device_stats *netdr_get_stats(struct net_device *netdev)
     return &nic->stats;
 }
 
-static int netdr_change_mtu(struct net_device, int mtu)
+static int netdr_change_mtu(struct net_device *netdev, int mtu) 
 {
     if(mtu < 68 || mtu > 1500)
         return -EINVAL; 
@@ -502,23 +504,24 @@ static int netdr_change_mtu(struct net_device, int mtu)
 static const struct net_device_ops netdr_netdev_ops = {
     .ndo_open = netdr_open, 
     .ndo_stop = netdr_stop, 
-    .ndo_statt_xmit = netdr_xmit, 
+    .ndo_start_xmit = netdr_xmit, 
     .ndo_get_stats = netdr_get_stats,
     .ndo_validate_addr = eth_validate_addr, 
     .ndo_set_mac_address = eth_mac_addr,  
+    .ndo_change_mtu = netdr_change_mtu, 
 }; 
 
-static void netdr_get_drvinfo(struct net_device,
+static void netdr_get_drvinfo(struct net_device *netdev, 
                               struct ethtool_drv_info *info)
 {
     struct netdr_nic *nic = netdev_priv(netdev); 
 
     strlcpy(info->driver, "netdr", sizeof(info->driver)); 
-    strlcpy(info->version, "1.0", sizeof(info->driver)); 
+    strlcpy(info->version, "1.0", sizeof(info->version)); 
     strlcpy(info->bus_info, pci_name(nic->pdev), sizeof(info->bus_info)); 
 }
 
-static const struct ethool_ops netdr_ethtool_ops =  {
+static const struct ethtool_ops netdr_ethtool_ops =  { 
     .get_drvinfo = netdr_get_drvinfo, 
     .get_link = ethtool_op_get_link, 
 }; 
@@ -526,7 +529,7 @@ static const struct ethool_ops netdr_ethtool_ops =  {
 
 static int netdr_reset_hw(struct netdr_nic *nic)
 {
-    int timeout; 
+    int timeout = 1000;
 
     netdr_write_reg(nic, REG_CTRL, CTRL_RESET); 
 
@@ -549,18 +552,18 @@ static int netdr_reset_hw(struct netdr_nic *nic)
 }
 
 
-static int netdr_probe(struct pci_dev *pdev, const struct pci_device *id)
+static int netdr_probe(struct pci_dev *pdev, const struct pci_device_id *id) 
 {
-    struct net_device = *netdev; 
+    struct net_device *netdev; 
     struct netdr_nic *nic; 
     int err; 
 
-    err = pci_enable(pdev); 
+    err = pci_enable_device(pdev); 
     if(err)
         return err; 
 
     /*set DMA mask for 32-bit addressing */ 
-    err = dma_set_mask_and_coherant(&pdev->dev, DMA_BIT_MASK(32)); 
+    err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)); 
     if(err)
     {
         dev_err(&pdev->dev, "Failed to set DMA mask\n"); 
@@ -583,7 +586,7 @@ static int netdr_probe(struct pci_dev *pdev, const struct pci_device *id)
     pci_set_drvdata(pdev, netdev); 
 
     nic = netdev_priv(netdev); 
-    nic->netdev = nettdev; 
+    nic->netdev = netdev; 
     nic->pdev = pdev; 
     nic->irq = pdev->irq; 
 
@@ -599,7 +602,7 @@ static int netdr_probe(struct pci_dev *pdev, const struct pci_device *id)
         goto _err_reset; 
 
     netdev->netdev_ops = &netdr_netdev_ops; 
-    netdev->ethtoll_ops = &netdr_ethtool_ops; 
+    netdev->ethtool_ops = &netdr_ethtool_ops; 
 
     netdr_write_reg(nic, REG_MAC_ADDR_LOW, 
                     *(u32*)&netdev->dev_addr[0]);
@@ -615,7 +618,7 @@ static int netdr_probe(struct pci_dev *pdev, const struct pci_device *id)
     return 0; 
 _err_register:
 _err_reset:
-    pci_iounmao(pdev, nic->hw_addr); 
+    pci_iounmap(pdev, nic->hw_addr); 
 _err_iomap:
     free_netdev(netdev); 
 _err_alloc:
@@ -632,7 +635,7 @@ static void netdr_remove(struct pci_dev *pdev)
     struct netdr_nic *nic = netdev_priv(netdev); 
 
     unregister_netdev(netdev);
-    netif_napi_dev(&nic->napi); 
+    netif_napi_del(&nic->napi); 
     pci_iounmap(pdev, nic->hw_addr); 
     free_netdev(netdev); 
     pci_release_regions(pdev); 
@@ -643,7 +646,7 @@ static void netdr_remove(struct pci_dev *pdev)
 }
 
 static const struct pci_device_id netdr_pci_tbl[] = {
-    {PCI_DEVICE(0x8086, 0X1234)}, 
+    {PCI_DEVICE(0x8086, 0x1234)}, 
     {0,}
 }; 
 MODULE_DEVICE_TABLE(pci, netdr_pci_tbl); 
@@ -667,6 +670,6 @@ static void __exit netdr_exit_module(void)
     pci_unregister_driver(&netdr_pci_driver); 
 }
 module_init(netdr_init_module); 
-module_exit(netdr_exit_module); 
+module_exit(netdr_exit_module);
 
-
+MODULE_LICENSE("GPL"); 
